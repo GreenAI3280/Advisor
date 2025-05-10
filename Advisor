@@ -1,0 +1,164 @@
+import argparse
+import pandas as pd
+import numpy as np
+from scipy.sparse import coo_matrix, save_npz, load_npz
+from lightfm import LightFM
+from sqlalchemy import create_engine, Column, Integer, Float, String, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import os
+
+Base = declarative_base()
+
+class Material(Base):
+    __tablename__ = 'materials'
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    category = Column(String)
+    cost_per_m2 = Column(Float)
+    carbon_per_m2 = Column(Float)
+
+class Interaction(Base):
+    __tablename__ = 'interactions'
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, index=True)
+    material_id = Column(Integer, ForeignKey('materials.id'), index=True)
+    usage_count = Column(Integer, default=1)
+
+def init_db(db_uri, materials_csv, interactions_csv):
+    """Initialize the SQLite database from provided CSV files."""
+    engine = create_engine(db_uri)
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    # Load materials
+    df_mat = pd.read_csv(materials_csv)
+    for _, row in df_mat.iterrows():
+        mat = Material(
+            id=int(row['id']),
+            name=row['name'],
+            category=row.get('category', None),
+            cost_per_m2=float(row['cost_per_m2']),
+            carbon_per_m2=float(row['carbon_per_m2'])
+        )
+        session.add(mat)
+    # Load interactions
+    df_int = pd.read_csv(interactions_csv)
+    for _, row in df_int.iterrows():
+        inter = Interaction(
+            project_id=int(row['project_id']),
+            material_id=int(row['material_id']),
+            usage_count=int(row.get('usage_count', 1))
+        )
+        session.add(inter)
+    session.commit()
+    print("Database initialized with materials and interactions.")
+
+def load_data(db_uri):
+    engine = create_engine(db_uri)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    # Load materials
+    mats = pd.read_sql(session.query(Material).statement, engine)
+    # Load interactions
+    ints = pd.read_sql(session.query(Interaction).statement, engine)
+    return mats, ints
+
+def build_interaction_matrix(interactions):
+    # Map external IDs to indices
+    user_ids = interactions['project_id'].unique()
+    item_ids = interactions['material_id'].unique()
+    user_map = {u: i for i,u in enumerate(sorted(user_ids))}
+    item_map = {v: j for j,v in enumerate(sorted(item_ids))}
+
+    rows, cols, data = [], [], []
+    for _, row in interactions.iterrows():
+        u = user_map[row['project_id']]
+        v = item_map[row['material_id']]
+        rows.append(u)
+        cols.append(v)
+        data.append(row.get('usage_count', 1))
+
+    matrix = coo_matrix((data, (rows, cols)), shape=(len(user_ids), len(item_ids)))
+    return matrix, user_map, item_map
+
+def train_and_save_model(interactions_matrix, epochs, components, model_path='lightfm_model.npz'):
+    model = LightFM(no_components=components, loss='warp')
+    model.fit(interactions_matrix, epochs=epochs, num_threads=4)
+    # Save model weights
+    np.savez(model_path,
+             item_embeddings=model.item_embeddings,
+             item_biases=model.item_biases)
+    print(f"Model trained and saved to {model_path}")
+    return model
+
+def load_model(model_path, components):
+    data = np.load(model_path)
+    model = LightFM(no_components=components)
+    model.item_embeddings = data['item_embeddings']
+    model.item_biases = data['item_biases']
+    return model
+
+def recommend(model, user_map, item_map, materials, project_id, top_n, output_csv='recommended_materials.csv'):
+    if project_id not in user_map:
+        raise ValueError(f"Project ID {project_id} not found in training data.")
+    user_idx = user_map[project_id]
+    n_items = model.item_embeddings.shape[0]
+    scores = model.predict(user_idx, np.arange(n_items))
+    # Build DataFrame of scores + material info
+    inv_item_map = {v:k for k,v in item_map.items()}
+    recs = []
+    for item_idx, score in enumerate(scores):
+        mat_id = inv_item_map[item_idx]
+        row = materials[materials['id'] == mat_id].iloc[0]
+        recs.append({
+            'material_id': mat_id,
+            'name': row['name'],
+            'category': row.get('category', ''),
+            'cost_per_m2': row['cost_per_m2'],
+            'carbon_per_m2': row['carbon_per_m2'],
+            'score': score
+        })
+    df_rec = pd.DataFrame(recs)
+    df_top = df_rec.sort_values('score', ascending=False).head(top_n)
+    df_top.to_csv(output_csv, index=False)
+    print(f"Top {top_n} recommendations saved to {output_csv}")
+    print(df_top.to_string(index=False))
+
+def main():
+    parser = argparse.ArgumentParser(description="Material Advisor: LightFM recommender for building materials.")
+    parser.add_argument('--init', action='store_true', help='Initialize database from CSVs')
+    parser.add_argument('--materials', help='Path to materials CSV')
+    parser.add_argument('--interactions', help='Path to interactions CSV')
+    parser.add_argument('--db', default='sqlite:///materials.db', help='Database URI')
+    parser.add_argument('--epochs', type=int, default=20, help='Training epochs')
+    parser.add_argument('--components', type=int, default=10, help='Number of latent dimensions')
+    parser.add_argument('--project-id', type=int, help='Project ID to recommend for')
+    parser.add_argument('--top-n', type=int, default=10, help='Number of recommendations')
+    args = parser.parse_args()
+
+    if args.init:
+        if not args.materials or not args.interactions:
+            parser.error('--init requires --materials and --interactions')
+        init_db(args.db, args.materials, args.interactions)
+        return
+
+    # Load data
+    materials, interactions = load_data(args.db)
+    # Build interactions matrix
+    inter_mat, user_map, item_map = build_interaction_matrix(interactions)
+    # Train or load model
+    model_path = 'lightfm_model.npz'
+    if os.path.exists(model_path):
+        print(f"Loading existing model from {model_path}")
+        model = load_model(model_path, args.components)
+    else:
+        model = train_and_save_model(inter_mat, args.epochs, args.components, model_path)
+    # Recommend
+    if args.project_id is None:
+        parser.error('Please specify --project-id for recommendations')
+    recommend(model, user_map, item_map, materials, args.project_id, args.top_n)
+
+if __name__ == '__main__':
+    main()
